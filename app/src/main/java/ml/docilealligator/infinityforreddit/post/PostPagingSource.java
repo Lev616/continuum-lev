@@ -141,6 +141,10 @@ public class PostPagingSource extends ListenableFuturePagingSource<String, Post>
     private boolean multiRedditUsernamesFetched = false;
     @Nullable
     private String subredditOnlyName;
+    // Reddit's search listing runs dry after roughly 250 results, far earlier than the normal
+    // listing. Once the sort-by-new search has run out, this flips and the feed carries on from the
+    // last post through the normal /new listing instead of ending.
+    private volatile boolean subredditSearchExhausted = false;
 
     /**
      * Whether the feed reading this source is showing media posts only, so that a page carrying no
@@ -719,7 +723,7 @@ public class PostPagingSource extends ListenableFuturePagingSource<String, Post>
 
         // Sort by new: use subreddit search with "*" as the query (sorted by new) instead of the
         // normal /new listing.
-        if (sortType.getType() == SortType.Type.NEW) {
+        if (sortType.getType() == SortType.Type.NEW && !subredditSearchExhausted) {
             if (accountName.equals(Account.ANONYMOUS_ACCOUNT)) {
                 return api.searchPostsInSpecificSubredditListenableFuture(apiName, "*",
                         SortType.Type.NEW, sortType.getTime(), loadParams.getKey());
@@ -762,7 +766,7 @@ public class PostPagingSource extends ListenableFuturePagingSource<String, Post>
             return Futures.immediateFuture(response);
         }, executor);
 
-        ListenableFuture<LoadResult<String, Post>> pageFuture = Futures.transform(retryTwice, this::transformData, executor);
+        ListenableFuture<LoadResult<String, Post>> pageFuture = Futures.transform(retryTwice, this::transformSubredditData, executor);
 
         ListenableFuture<LoadResult<String, Post>> partialLoadResultFuture =
                 Futures.catching(pageFuture, HttpException.class,
@@ -770,6 +774,35 @@ public class PostPagingSource extends ListenableFuturePagingSource<String, Post>
 
         return Futures.catching(partialLoadResultFuture,
                 IOException.class, LoadResult.Error::new, executor);
+    }
+
+    // Like transformData, but when the sort-by-new search runs out of pages, hands Paging the last
+    // post's fullname as the next key and switches later loads to the normal /new listing, which
+    // goes much deeper than search does.
+    private LoadResult<String, Post> transformSubredditData(Response<String> response) {
+        LoadResult<String, Post> result = transformData(response);
+
+        android.util.Log.d("SubredditPaging", "code=" + response.code()
+                + " exhausted=" + subredditSearchExhausted
+                + " total=" + posts.size()
+                + " result=" + (result instanceof LoadResult.Page
+                ? "Page next=" + ((LoadResult.Page<String, Post>) result).getNextKey()
+                + " size=" + ((LoadResult.Page<String, Post>) result).getData().size()
+                : "Error"));
+
+        if (sortType.getType() == SortType.Type.NEW && !subredditSearchExhausted
+                && result instanceof LoadResult.Page && !posts.isEmpty()) {
+            @SuppressWarnings("unchecked")
+            LoadResult.Page<String, Post> page = (LoadResult.Page<String, Post>) result;
+            if (page.getNextKey() == null) {
+                subredditSearchExhausted = true;
+                String lastFullName = posts.get(posts.size() - 1).getFullName();
+                if (lastFullName != null && !lastFullName.isEmpty()) {
+                    return new LoadResult.Page<>(page.getData(), page.getPrevKey(), lastFullName);
+                }
+            }
+        }
+        return result;
     }
 
     private ListenableFuture<Response<String>> fetchUserPosts(RedditAPI api, @Nullable String afterKey) {
