@@ -11,6 +11,7 @@ import android.graphics.Rect;
 import android.os.Bundle;
 import android.os.CountDownTimer;
 import android.os.Handler;
+import android.os.SystemClock;
 import android.view.KeyEvent;
 import android.view.LayoutInflater;
 import android.view.MenuItem;
@@ -144,6 +145,9 @@ public abstract class PostFragmentBase extends Fragment {
     @Nullable
     protected StaggeredGridLayoutManager mStaggeredGridLayoutManager;
     protected boolean hasPost;
+    /** True once Paging reports there is nothing after the last loaded post. Set by the feed's load state listener. */
+    protected boolean feedEndReached;
+    private long lastEndOfFeedToastMs;
     protected long postFragmentId;
     protected Handler lazyModeHandler;
     protected CountDownTimer resumeLazyModeCountDownTimer;
@@ -445,6 +449,55 @@ public abstract class PostFragmentBase extends Fragment {
             }
         }
         return false;
+    }
+
+    /**
+     * Moves the feed by {@code count} posts for the volume keys, never past the posts that are loaded.
+     *
+     * <p>Held, the volume keys repeat about 20 times a second, which is much faster than a feed can
+     * fetch its next page. The jump used to be {@code firstVisible + count} with no upper bound, so
+     * once the loaded posts ran out it asked the layout manager for a position that does not exist,
+     * the layout manager ignored it, and the key was still reported as handled. The list stood still
+     * with nothing on screen to say why.
+     *
+     * <p>Now the target is clamped to the last loaded post. Landing on it binds it, which is what
+     * tells Paging to fetch more, and the last post is read once more so Paging is asked again even
+     * if an earlier request for the same position has been dropped. If Paging says the feed really is
+     * over, a toast says so.
+     *
+     * @param count how many posts to move: negative is up, positive is down
+     */
+    protected final boolean scrollLoadedPostsByCount(int count) {
+        if (mLinearLayoutManager == null) {
+            return false;
+        }
+        PostRecyclerViewAdapter adapter = getPostAdapter();
+        int loaded = adapter == null ? 0 : adapter.getItemCount();
+        if (adapter == null || loaded < 1) {
+            return true;
+        }
+        int pos = mLinearLayoutManager.findFirstVisibleItemPosition();
+        if (pos == RecyclerView.NO_POSITION) {
+            return true;
+        }
+
+        int last = loaded - 1;
+        int target = Math.max(0, Math.min(pos + count, last));
+        mLinearLayoutManager.scrollToPositionWithOffset(target, 0);
+
+        if (count > 0 && target >= last) {
+            if (feedEndReached) {
+                long now = SystemClock.elapsedRealtime();
+                if (now - lastEndOfFeedToastMs > 3000) {
+                    lastEndOfFeedToastMs = now;
+                    Toast.makeText(mActivity, R.string.no_more_posts, Toast.LENGTH_SHORT).show();
+                }
+            } else {
+                // Reading an item reports its position to Paging, which fetches more if it is near the end.
+                adapter.getItemByPosition(last);
+            }
+        }
+        return true;
     }
 
     public final long getPostFragmentId() {

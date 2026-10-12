@@ -401,14 +401,7 @@ public class HistoryPostFragment extends PostFragmentBase implements FragmentCom
 
     @Override
     protected boolean scrollPostsByCount(int count) {
-        if (mLinearLayoutManager != null) {
-            int pos = mLinearLayoutManager.findFirstVisibleItemPosition();
-            int targetPosition = pos + count;
-            mLinearLayoutManager.scrollToPositionWithOffset(targetPosition, 0);
-            return true;
-        } else {
-            return false;
-        }
+        return scrollLoadedPostsByCount(count);
     }
 
     @Override
@@ -440,6 +433,7 @@ public class HistoryPostFragment extends PostFragmentBase implements FragmentCom
         mAdapter.addLoadStateListener(combinedLoadStates -> {
             LoadState refreshLoadState = combinedLoadStates.getRefresh();
             LoadState appendLoadState = combinedLoadStates.getAppend();
+            feedEndReached = appendLoadState instanceof LoadState.NotLoading && appendLoadState.getEndOfPaginationReached();
 
             binding.swipeRefreshLayoutHistoryPostFragment.setRefreshing(refreshLoadState instanceof LoadState.Loading);
             if (refreshLoadState instanceof LoadState.NotLoading) {

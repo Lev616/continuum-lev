@@ -280,14 +280,7 @@ public class PostFragment extends PostFragmentBase implements FragmentCommunicat
 
     @Override
     protected boolean scrollPostsByCount(int count) {
-        if (mLinearLayoutManager != null) {
-            int pos = mLinearLayoutManager.findFirstVisibleItemPosition();
-            int targetPosition = pos + count;
-            mLinearLayoutManager.scrollToPositionWithOffset(targetPosition, 0);
-            return true;
-        } else {
-            return false;
-        }
+        return scrollLoadedPostsByCount(count);
     }
 
     @Override
@@ -1372,6 +1365,7 @@ public class PostFragment extends PostFragmentBase implements FragmentCommunicat
         mAdapter.addLoadStateListener(combinedLoadStates -> {
             LoadState refreshLoadState = combinedLoadStates.getRefresh();
             LoadState appendLoadState = combinedLoadStates.getAppend();
+            feedEndReached = appendLoadState instanceof LoadState.NotLoading && appendLoadState.getEndOfPaginationReached();
 
             binding.swipeRefreshLayoutPostFragment.setRefreshing(refreshLoadState instanceof LoadState.Loading);
             if (refreshLoadState instanceof LoadState.NotLoading) {
