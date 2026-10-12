@@ -10,6 +10,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch subreddit lists (sibling checkout the build expects)
+        run: git clone --depth 1 https://github.com/cygnusx-1-org/subreddit-lists.git "$GITHUB_WORKSPACE/../subreddit-lists"
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
