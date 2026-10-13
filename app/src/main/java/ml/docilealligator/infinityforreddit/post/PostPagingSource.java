@@ -17,6 +17,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
@@ -802,9 +803,11 @@ public class PostPagingSource extends ListenableFuturePagingSource<String, Post>
 
         // Sort by new, logged in: read the subreddit through a private helper multireddit.
         if (sortType.getType() == SortType.Type.NEW && canUseHelperMulti(apiName)) {
-            final String helperName = "cnt_" + apiName.toLowerCase(Locale.ROOT);
+            // canUseHelperMulti has already ruled out a null name; requireNonNull tells NullAway.
+            final String helperSubreddit = Objects.requireNonNull(apiName);
+            final String helperName = "cnt_" + helperSubreddit.toLowerCase(Locale.ROOT);
             final String helperPath = "/user/" + accountName + "/m/" + helperName;
-            return Futures.transformAsync(ensureHelperMulti(api, helperName, helperPath, apiName), ready -> {
+            return Futures.transformAsync(ensureHelperMulti(api, helperName, helperPath, helperSubreddit), ready -> {
                 if (!ready) {
                     helperMultiFailed = true;
                     usingHelperMulti = false;
