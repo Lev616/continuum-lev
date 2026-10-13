@@ -15,9 +15,12 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import ml.docilealligator.infinityforreddit.Constants;
 import ml.docilealligator.infinityforreddit.RedditDataRoomDatabase;
@@ -145,6 +148,18 @@ public class PostPagingSource extends ListenableFuturePagingSource<String, Post>
     // listing. Once the sort-by-new search has run out, this flips and the feed carries on from the
     // last post through the normal /new listing instead of ending.
     private volatile boolean subredditSearchExhausted = false;
+    // Sort by new on a single subreddit: search stops at ~250 results, while a multireddit's own
+    // /new listing goes much deeper. So a logged-in account browses a private helper multireddit
+    // (one per subreddit, created on first use) and search stays as the fallback.
+    //
+    // Helpers already confirmed to exist this session, keyed "<account>/<helper name>". Static so a
+    // refresh, which builds a new source, does not repeat the setup calls.
+    private static final Set<String> READY_HELPER_MULTIS = ConcurrentHashMap.newKeySet();
+    private static final Pattern HELPER_MULTI_ELIGIBLE = Pattern.compile("[A-Za-z0-9_]{1,21}");
+    // True once this source is reading from the helper multireddit (false while on search).
+    private volatile boolean usingHelperMulti = false;
+    // Set when setup or the first page failed, so this source stays on search.
+    private volatile boolean helperMultiFailed = false;
 
     /**
      * Whether the feed reading this source is showing media posts only, so that a page carrying no
@@ -716,10 +731,101 @@ public class PostPagingSource extends ListenableFuturePagingSource<String, Post>
                 IOException.class, LoadResult.Error::new, executor);
     }
 
+    // Whether this feed may read through a helper multireddit: a plain subreddit (not a special
+    // listing), a logged-in account, and no earlier failure on this source.
+    private boolean canUseHelperMulti(@Nullable String apiName) {
+        if (postType != PostType.SUBREDDIT || helperMultiFailed || accessToken == null
+                || Account.ANONYMOUS_ACCOUNT.equals(accountName) || apiName == null
+                || !HELPER_MULTI_ELIGIBLE.matcher(apiName).matches()) {
+            return false;
+        }
+        switch (apiName.toLowerCase(Locale.ROOT)) {
+            case "popular":
+            case "all":
+            case "friends":
+            case "mod":
+            case "random":
+            case "randnsfw":
+                return false;
+            default:
+                return true;
+        }
+    }
+
+    // Makes sure the private helper multireddit holding just this subreddit exists. Yields false on
+    // any failure (limit reached, network, bad response), in which case the caller uses search.
+    private ListenableFuture<Boolean> ensureHelperMulti(RedditAPI api, String helperName, String helperPath,
+                                                        String subreddit) {
+        final String key = accountName + "/" + helperName;
+        if (READY_HELPER_MULTIS.contains(key)) {
+            return Futures.immediateFuture(true);
+        }
+        return Futures.submit(() -> {
+            try {
+                Map<String, String> header = APIUtils.getOAuthHeader(accessToken);
+                Response<String> info = api.getMultiRedditInfo(header, helperPath).execute();
+                if (info.isSuccessful()) {
+                    READY_HELPER_MULTIS.add(key);
+                    return true;
+                }
+                if (info.code() != 404) {
+                    return false;
+                }
+                JSONObject model = new JSONObject();
+                model.put("display_name", helperName);
+                model.put("description_md", "");
+                model.put("visibility", "private");
+                JSONArray subs = new JSONArray();
+                subs.put(new JSONObject().put("name", subreddit));
+                model.put("subreddits", subs);
+
+                Map<String, String> params = new HashMap<>();
+                params.put(APIUtils.MULTIPATH_KEY, helperPath);
+                params.put(APIUtils.MODEL_KEY, model.toString());
+                Response<String> created = api.createMultiReddit(header, params).execute();
+                // 409: it already exists (created by a concurrent load), which is just as good.
+                if (created.isSuccessful() || created.code() == 409) {
+                    READY_HELPER_MULTIS.add(key);
+                    return true;
+                }
+                return false;
+            } catch (IOException | JSONException e) {
+                return false;
+            }
+        }, executor);
+    }
+
     private ListenableFuture<Response<String>> fetchSubredditPosts(LoadParams<String> loadParams, RedditAPI api, int limit) {
         // r/ContinuumAll is a name the app gives r/all's listing so a post filter can target it on
         // its own. Only the API path is rewritten; everything else keeps the ContinuumAll identity.
         String apiName = Constants.apiSubredditName(subredditOrUserName);
+
+        // Sort by new, logged in: read the subreddit through a private helper multireddit.
+        if (sortType.getType() == SortType.Type.NEW && canUseHelperMulti(apiName)) {
+            final String helperName = "cnt_" + apiName.toLowerCase(Locale.ROOT);
+            final String helperPath = "/user/" + accountName + "/m/" + helperName;
+            return Futures.transformAsync(ensureHelperMulti(api, helperName, helperPath, apiName), ready -> {
+                if (!ready) {
+                    helperMultiFailed = true;
+                    usingHelperMulti = false;
+                    return fetchSubredditPosts(loadParams, api, limit);
+                }
+                usingHelperMulti = true;
+                ListenableFuture<Response<String>> multiPosts = api.getMultiRedditPostsOauthListenableFuture(
+                        helperPath, SortType.Type.NEW, loadParams.getKey(), sortType.getTime(),
+                        APIUtils.getOAuthHeader(accessToken), 100);
+                return Futures.transformAsync(multiPosts, response -> {
+                    if (!response.isSuccessful() && loadParams.getKey() == null) {
+                        // The helper was deleted or cannot be read: forget it and use search.
+                        READY_HELPER_MULTIS.remove(accountName + "/" + helperName);
+                        helperMultiFailed = true;
+                        usingHelperMulti = false;
+                        return fetchSubredditPosts(loadParams, api, limit);
+                    }
+                    return Futures.immediateFuture(response);
+                }, executor);
+            }, executor);
+        }
 
         // Sort by new: use subreddit search with "*" as the query (sorted by new) instead of the
         // normal /new listing.
@@ -783,6 +889,7 @@ public class PostPagingSource extends ListenableFuturePagingSource<String, Post>
         LoadResult<String, Post> result = transformData(response);
 
         android.util.Log.d("SubredditPaging", "code=" + response.code()
+                + " helper=" + usingHelperMulti
                 + " exhausted=" + subredditSearchExhausted
                 + " total=" + posts.size()
                 + " result=" + (result instanceof LoadResult.Page
@@ -790,7 +897,7 @@ public class PostPagingSource extends ListenableFuturePagingSource<String, Post>
                 + " size=" + ((LoadResult.Page<String, Post>) result).getData().size()
                 : "Error"));
 
-        if (sortType.getType() == SortType.Type.NEW && !subredditSearchExhausted
+        if (sortType.getType() == SortType.Type.NEW && !usingHelperMulti && !subredditSearchExhausted
                 && result instanceof LoadResult.Page && !posts.isEmpty()) {
             @SuppressWarnings("unchecked")
             LoadResult.Page<String, Post> page = (LoadResult.Page<String, Post>) result;
